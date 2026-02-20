@@ -82,9 +82,12 @@ import org.openmetadata.search.IndexMappingLoader;
 import org.openmetadata.service.apps.ApplicationContext;
 import org.openmetadata.service.apps.ApplicationHandler;
 import org.openmetadata.service.apps.McpServerProvider;
+import org.openmetadata.service.apps.bundles.searchIndex.distributed.DistributedJobParticipant;
+import org.openmetadata.service.apps.bundles.searchIndex.distributed.ServerIdentityResolver;
 import org.openmetadata.service.apps.scheduler.AppScheduler;
 import org.openmetadata.service.audit.AuditLogEventPublisher;
 import org.openmetadata.service.audit.AuditLogRepository;
+import org.openmetadata.service.cache.CacheConfig;
 import org.openmetadata.service.config.OMWebBundle;
 import org.openmetadata.service.config.OMWebConfiguration;
 import org.openmetadata.service.events.EventFilter;
@@ -97,9 +100,12 @@ import org.openmetadata.service.exception.JsonMappingExceptionMapper;
 import org.openmetadata.service.exception.OMErrorPageHandler;
 import org.openmetadata.service.fernet.Fernet;
 import org.openmetadata.service.governance.workflows.WorkflowHandler;
+import org.openmetadata.service.jdbi3.BulkExecutor;
 import org.openmetadata.service.jdbi3.CollectionDAO;
+import org.openmetadata.service.jdbi3.EntityRelationshipRepository;
 import org.openmetadata.service.jdbi3.EntityRepository;
 import org.openmetadata.service.jdbi3.MigrationDAO;
+import org.openmetadata.service.jdbi3.SystemRepository;
 import org.openmetadata.service.jdbi3.locator.ConnectionAwareAnnotationSqlLocator;
 import org.openmetadata.service.jdbi3.locator.ConnectionType;
 import org.openmetadata.service.jobs.EnumCleanupHandler;
@@ -124,6 +130,7 @@ import org.openmetadata.service.resources.filters.ETagRequestFilter;
 import org.openmetadata.service.resources.filters.ETagResponseFilter;
 import org.openmetadata.service.resources.settings.SettingsCache;
 import org.openmetadata.service.search.SearchRepository;
+import org.openmetadata.service.search.SearchRepositoryFactory;
 import org.openmetadata.service.secrets.SecretsManagerFactory;
 import org.openmetadata.service.secrets.masker.EntityMaskerFactory;
 import org.openmetadata.service.security.AuthCallbackServlet;
@@ -160,6 +167,7 @@ import org.openmetadata.service.socket.SocketAddressFilter;
 import org.openmetadata.service.socket.WebSocketManager;
 import org.openmetadata.service.swagger.SwaggerBundle;
 import org.openmetadata.service.swagger.SwaggerBundleConfiguration;
+import org.openmetadata.service.util.AsyncService;
 import org.openmetadata.service.util.CustomParameterNameProvider;
 import org.openmetadata.service.util.incidentSeverityClassifier.IncidentSeverityClassifierInterface;
 import org.quartz.SchedulerException;
@@ -237,14 +245,22 @@ public class OpenMetadataApplication extends Application<OpenMetadataApplication
     // Metrics initialization now handled by MicrometerBundle
 
     jdbi = createAndSetupJDBI(environment, catalogConfig.getDataSourceFactory());
+    // Initialize the MigrationValidationClient, used in the Settings Repository
+    MigrationValidationClient.initialize(jdbi.onDemand(MigrationDAO.class), catalogConfig);
     Entity.setCollectionDAO(getDao(jdbi));
+    Entity.setEntityRelationshipRepository(
+        new EntityRelationshipRepository(Entity.getCollectionDAO()));
+    Entity.setSystemRepository(new SystemRepository());
     Entity.setJobDAO(jdbi.onDemand(JobDAO.class));
     Entity.setJdbi(jdbi);
 
-    initializeSearchRepository(catalogConfig);
-    // Initialize the MigrationValidationClient, used in the Settings Repository
-    MigrationValidationClient.initialize(jdbi.onDemand(MigrationDAO.class), catalogConfig);
-    // as first step register all the repositories
+    // Initialize bulk operation executor
+    BulkExecutor.initialize(catalogConfig.getBulkOperationConfiguration());
+
+    // Phase 1: Core search infrastructure (needed by repositories)
+    initializeCoreSearchInfrastructure(catalogConfig);
+
+    // as first step register all the repositories (now they can access SearchRepository)
     Entity.initializeRepositories(catalogConfig, jdbi);
     auditLogRepository = new AuditLogRepository(Entity.getCollectionDAO());
     Entity.setAuditLogRepository(auditLogRepository);
@@ -257,8 +273,14 @@ public class OpenMetadataApplication extends Application<OpenMetadataApplication
     // Initialize Workflow Handler
     WorkflowHandler.initialize(catalogConfig);
 
-    // Init Settings Cache after repositories
+    // Init Settings Cache after repositories and Fernet (needed for database access and encryption)
     SettingsCache.initialize(catalogConfig);
+
+    // Phase 2: Advanced search features (after settings are available)
+    initializeAdvancedSearchFeatures();
+
+    // Phase 3: Vector search (embeddings + vector index)
+    Entity.getSearchRepository().initializeVectorSearchService();
 
     SecurityConfigurationManager.getInstance().initialize(this, catalogConfig, environment);
 
@@ -341,6 +363,9 @@ public class OpenMetadataApplication extends Application<OpenMetadataApplication
         .lifecycle()
         .manage(new GenericBackgroundWorker(jdbi.onDemand(JobDAO.class), registry));
 
+    // Register Distributed Job Participant for distributed search indexing
+    registerDistributedJobParticipant(environment, jdbi, catalogConfig.getCacheConfig());
+
     // Register Event publishers
     registerEventPublisher(catalogConfig);
 
@@ -398,10 +423,7 @@ public class OpenMetadataApplication extends Application<OpenMetadataApplication
   private void registerHealthCheckJobs(OpenMetadataApplicationConfig catalogConfig) {
     ServicesStatusJobHandler healthCheckStatusHandler =
         ServicesStatusJobHandler.create(
-            catalogConfig.getEventMonitorConfiguration(),
-            catalogConfig.getPipelineServiceClientConfiguration(),
-            catalogConfig.getClusterName());
-    healthCheckStatusHandler.addPipelineServiceStatusJob();
+            catalogConfig.getEventMonitorConfiguration(), catalogConfig.getClusterName());
     healthCheckStatusHandler.addDatabaseAndSearchStatusJobs();
   }
 
@@ -521,23 +543,46 @@ public class OpenMetadataApplication extends Application<OpenMetadataApplication
     }
   }
 
-  protected void initializeSearchRepository(OpenMetadataApplicationConfig config) {
-    // initialize Search Repository, all repositories use SearchRepository this line should always
-    // before initializing repository
+  /**
+   * Phase 1: Initialize core search infrastructure without advanced features.
+   * This creates the basic SearchRepository and SearchClient but defers
+   * lineage builders that depend on settings.
+   */
+  protected void initializeCoreSearchInfrastructure(OpenMetadataApplicationConfig config) {
     Integer databaseMaxSize = config.getDataSourceFactory().getMaxSize();
     LOG.info(
-        "AUTO-TUNE INIT: Initializing SearchRepository with database max pool size: {}",
+        "Phase 1: Initializing core search infrastructure with database max pool size: {}",
         databaseMaxSize);
+
     SearchRepository searchRepository =
-        new SearchRepository(
+        SearchRepositoryFactory.createSearchRepository(
             config.getElasticSearchConfiguration(), config.getDataSourceFactory().getMaxSize());
     Entity.setSearchRepository(searchRepository);
 
-    // Initialize RDF if enabled
+    // Initialize RDF if enabled (core infrastructure)
     RdfConfiguration rdfConfig = config.getRdfConfiguration();
     if (rdfConfig != null && rdfConfig.getEnabled() != null && rdfConfig.getEnabled()) {
       RdfUpdater.initialize(rdfConfig);
       LOG.info("RDF knowledge graph support initialized");
+    }
+
+    LOG.info("Core search infrastructure initialization completed");
+  }
+
+  /**
+   * Phase 2: Initialize advanced search features that depend on settings.
+   * This includes lineage builders and other components that require
+   * database settings to be available.
+   */
+  protected void initializeAdvancedSearchFeatures() {
+    LOG.info("Phase 2: Initializing advanced search features");
+
+    SearchRepository searchRepository = Entity.getSearchRepository();
+    if (searchRepository != null) {
+      searchRepository.initializeLineageComponents();
+      LOG.info("Advanced search features initialization completed");
+    } else {
+      LOG.warn("SearchRepository not found during advanced features initialization");
     }
   }
 
@@ -1016,6 +1061,29 @@ public class OpenMetadataApplication extends Application<OpenMetadataApplication
     }
   }
 
+  protected void registerDistributedJobParticipant(
+      Environment environment, Jdbi jdbi, CacheConfig cacheConfig) {
+    try {
+      CollectionDAO collectionDAO = jdbi.onDemand(CollectionDAO.class);
+      SearchRepository searchRepository = Entity.getSearchRepository();
+      String serverId = ServerIdentityResolver.getInstance().getServerId();
+
+      DistributedJobParticipant participant =
+          new DistributedJobParticipant(collectionDAO, searchRepository, serverId, cacheConfig);
+      environment.lifecycle().manage(participant);
+
+      String notifierType =
+          (cacheConfig != null && cacheConfig.provider == CacheConfig.Provider.redis)
+              ? "Redis Pub/Sub"
+              : "database polling";
+      LOG.info(
+          "Registered DistributedJobParticipant for distributed search indexing using {}",
+          notifierType);
+    } catch (Exception e) {
+      LOG.warn("Failed to register DistributedJobParticipant: {}", e.getMessage());
+    }
+  }
+
   public static void main(String[] args) throws Exception {
     OpenMetadataApplication openMetadataApplication = new OpenMetadataApplication();
     openMetadataApplication.run(args);
@@ -1032,6 +1100,7 @@ public class OpenMetadataApplication extends Application<OpenMetadataApplication
     public void stop() throws InterruptedException, SchedulerException {
       LOG.info("Cache with Id Stats {}", EntityRepository.CACHE_WITH_ID.stats());
       LOG.info("Cache with name Stats {}", EntityRepository.CACHE_WITH_NAME.stats());
+      AsyncService.getInstance().shutdown();
       EventPubSub.shutdown();
       AppScheduler.shutDown();
       EventSubscriptionScheduler.shutDown();

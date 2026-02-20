@@ -61,6 +61,9 @@ from metadata.generated.schema.entity.services.connections.database.redshiftConn
 from metadata.generated.schema.entity.services.connections.database.salesforceConnection import (
     SalesforceConnection,
 )
+from metadata.generated.schema.entity.services.connections.database.starrocksConnection import (
+    StarRocksConnection,
+)
 from metadata.generated.schema.entity.services.connections.messaging.kafkaConnection import (
     KafkaConnection,
 )
@@ -69,7 +72,10 @@ from metadata.generated.schema.entity.services.connections.pipeline.matillionCon
 )
 from metadata.generated.schema.security.ssl import verifySSLConfig
 from metadata.generated.schema.security.ssl.verifySSLConfig import SslMode
-from metadata.ingestion.connections.builders import init_empty_connection_arguments
+from metadata.ingestion.connections.builders import (
+    init_empty_connection_arguments,
+    init_empty_connection_options,
+)
 from metadata.ingestion.models.custom_pydantic import CustomSecretStr
 from metadata.ingestion.source.connections import get_connection
 from metadata.utils.logger import utils_logger
@@ -123,9 +129,12 @@ class SSLManager:
 
     @setup_ssl.register(MysqlConnection)
     @setup_ssl.register(DorisConnection)
+    @setup_ssl.register(StarRocksConnection)
     def _(self, connection):
         # Use the temporary file paths for SSL configuration
-        connection = cast(Union[MysqlConnection, DorisConnection], connection)
+        connection = cast(
+            Union[MysqlConnection, DorisConnection, StarRocksConnection], connection
+        )
         connection.connectionArguments = (
             connection.connectionArguments or init_empty_connection_arguments()
         )
@@ -308,24 +317,24 @@ class SSLManager:
     def _(self, connection):
         connection = cast(Db2Connection, connection)
 
-        if not connection.connectionArguments:
-            connection.connectionArguments = init_empty_connection_arguments()
+        if not connection.connectionOptions:
+            connection.connectionOptions = init_empty_connection_options()
 
         if connection.sslMode and connection.sslMode != SslMode.disable:
-            connection.connectionArguments.root["SECURITY"] = "SSL"
+            connection.connectionOptions.root["SECURITY"] = "SSL"
 
             if self.ca_file_path:
-                connection.connectionArguments.root[
+                connection.connectionOptions.root[
                     "SSLServerCertificate"
                 ] = self.ca_file_path
 
             if self.cert_file_path:
-                connection.connectionArguments.root[
+                connection.connectionOptions.root[
                     "SSLClientKeystoredb"
                 ] = self.cert_file_path
 
             if self.key_file_path:
-                connection.connectionArguments.root[
+                connection.connectionOptions.root[
                     "SSLClientKeystash"
                 ] = self.key_file_path
 
@@ -371,8 +380,11 @@ def _(connection) -> Union[SSLManager, None]:
 
 @check_ssl_and_init.register(MysqlConnection)
 @check_ssl_and_init.register(DorisConnection)
+@check_ssl_and_init.register(StarRocksConnection)
 def _(connection):
-    service_connection = cast(Union[MysqlConnection, DorisConnection], connection)
+    service_connection = cast(
+        Union[MysqlConnection, DorisConnection, StarRocksConnection], connection
+    )
     ssl: Optional[verifySSLConfig.SslConfig] = service_connection.sslConfig
     if ssl and (ssl.root.caCertificate or ssl.root.sslCertificate or ssl.root.sslKey):
         return SSLManager(

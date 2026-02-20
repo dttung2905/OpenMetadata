@@ -54,6 +54,7 @@
         "Couchbase",
         "Greenplum",
         "Doris",
+        "StarRocks",
         "UnityCatalog",
         "SAS",
         "Iceberg",
@@ -65,7 +66,9 @@
         "SSAS",
         "Epic",
         "ServiceNow",
-        "Dremio"
+        "Dremio",
+        "MicrosoftFabric",
+        "BurstIQ"
       ],
       "javaEnums": [
         {
@@ -186,6 +189,9 @@
           "name": "Doris"
         },
         {
+          "name": "StarRocks"
+        },
+        {
           "name": "UnityCatalog"
         },
         {
@@ -220,6 +226,12 @@
         },
         {
           "name": "Dremio"
+        },
+        {
+          "name": "MicrosoftFabric"
+        },
+        {
+          "name": "BurstIQ"
         }
       ]
     },
@@ -345,6 +357,9 @@
               "$ref": "./connections/database/dorisConnection.json"
             },
             {
+              "$ref": "./connections/database/starrocksConnection.json"
+            },
+            {
               "$ref": "./connections/database/unityCatalogConnection.json"
             },
             {
@@ -379,6 +394,12 @@
             },
             {
               "$ref": "./connections/database/dremioConnection.json"
+            },
+            {
+              "$ref": "./connections/database/microsoftFabricConnection.json"
+            },
+            {
+              "$ref": "./connections/database/burstIQConnection.json"
             }
           ]
         }
