@@ -18,7 +18,6 @@ from metadata.generated.schema.entity.services.connections.database.iceberg.iceb
     IcebergCatalog,
 )
 from metadata.generated.schema.entity.services.connections.database.iceberg.restCatalogConnection import (
-    OAuth2Credential,
     RestCatalogConnection,
     Sigv4,
 )
@@ -71,11 +70,11 @@ class TestIcebergRestCatalog(TestCase):
             warehouseLocation="s3://my-bucket/warehouse",
             connection=RestCatalogConnection(
                 uri="https://my-rest-catalog.example.com/api/v1",
-                credential=OAuth2Credential(
-                    clientId="test-client-id",
-                    clientSecret="test-client-secret",
-                    scopes="all-apis",
-                ),
+                credential={
+                    "clientId": "test-client-id",
+                    "clientSecret": "test-client-secret",
+                    "scopes": "all-apis",
+                },
             ),
         )
 
@@ -100,10 +99,10 @@ class TestIcebergRestCatalog(TestCase):
             warehouseLocation="s3://my-bucket/warehouse",
             connection=RestCatalogConnection(
                 uri="https://my-rest-catalog.example.com/api/v1",
-                credential=OAuth2Credential(
-                    clientId="test-client-id",
-                    clientSecret="test-client-secret",
-                ),
+                credential={
+                    "clientId": "test-client-id",
+                    "clientSecret": "test-client-secret",
+                },
             ),
         )
 
